@@ -120,6 +120,8 @@ class ViewerState:
     auto_roll: float = 0.0
     auto_pitch: float = 0.0
     auto_yaw: float = 0.0
+    telemetry_offset_ms: float = 0.0
+    current_video_t_ms: float = 0.0
     telemetry_data: TelemetryData = field(default_factory=TelemetryData)
     telemetry_frame: TelemetryFrameInfo = field(default_factory=TelemetryFrameInfo)
     last_auto_t_ms: float | None = None
@@ -142,6 +144,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Initial aspect preset index: 0=1:1, 1=16:9, 2=9:16, 3=4:3",
+    )
+    parser.add_argument(
+        "--telemetry-offset-ms",
+        type=float,
+        default=0.0,
+        help="Shift telemetry timing relative to video time in milliseconds",
     )
     return parser.parse_args()
 
@@ -533,6 +541,13 @@ def compute_auto_terms_for_time(
     return auto_roll, auto_pitch, auto_yaw
 
 
+def get_video_time_ms(cap: cv2.VideoCapture, fallback_frame_idx: int, fps: float) -> float:
+    pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+    if pos_msec > 0.0:
+        return pos_msec
+    return (fallback_frame_idx / max(fps, 1e-6)) * 1000.0
+
+
 def build_remap(
     in_h: int,
     in_w: int,
@@ -620,11 +635,14 @@ def render_frame(frame: np.ndarray, state: ViewerState) -> np.ndarray:
     return cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
 
 
-def update_auto_orientation(state: ViewerState, fps: float) -> None:
+def update_auto_orientation(state: ViewerState, fps: float, video_t_ms: float | None = None) -> None:
     if not state.telemetry_data.loaded:
         return
 
-    t_ms = (state.frame_idx / max(fps, 1e-6)) * 1000.0
+    if video_t_ms is None:
+        video_t_ms = (state.frame_idx / max(fps, 1e-6)) * 1000.0
+
+    t_ms = max(0.0, video_t_ms + state.telemetry_offset_ms)
     dt_ms = 0.0 if state.last_auto_t_ms is None else max(0.0, t_ms - state.last_auto_t_ms)
 
     imu = interpolate_imu_sample(state.telemetry_data.imu_samples, t_ms)
@@ -699,13 +717,13 @@ def draw_overlay(frame: np.ndarray, state: ViewerState, fps: float, total_frames
             f"pitch={tf.pitch_deg if tf.pitch_deg is not None else float('nan'):.2f} "
             f"course={course_txt} speed={speed_txt} rbias={state.telemetry_data.roll_bias_deg:+.1f}"
         )
-        line6 = f"gps lat={lat_txt} lon={lon_txt}"
+        line6 = f"gps lat={lat_txt} lon={lon_txt} offset={state.telemetry_offset_ms:+.0f}ms"
     else:
         line4 = f"telemetry unavailable: {state.telemetry_data.status or 'no data'}"
         line5 = "auto-level and auto-yaw will not affect playback without telemetry data"
-        line6 = "gps lat=n/a lon=n/a"
+        line6 = f"gps lat=n/a lon=n/a offset={state.telemetry_offset_ms:+.0f}ms"
 
-    line7 = "drag=pan/tilt wheel=fov z/x=roll r=aspect a=auto-level y=auto-yaw p=play s=save i=info q/esc=quit"
+    line7 = "drag=pan/tilt wheel=fov z/x=roll r=aspect a=auto-level y=auto-yaw [/] sync p=play s=save i=info q/esc=quit"
 
     panel_lines = [line1, line2, line3, line4, line5, line6, line7]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -759,7 +777,7 @@ def draw_horizon_line(frame: np.ndarray, state: ViewerState) -> None:
         frame_w=frame.shape[1],
         frame_h=frame.shape[0],
         h_fov_deg=state.fov,
-        telemetry_roll_deg=telemetry_roll + eff_roll,
+        telemetry_roll_deg=-(telemetry_roll + eff_roll),
         telemetry_pitch_deg=telemetry_pitch + eff_pitch,
     )
     cv2.line(frame, p0, p1, HORIZON_COLOR, 2, cv2.LINE_AA)
@@ -1045,6 +1063,14 @@ def process_key(key: int, state: ViewerState, input_path: Path, output_path: Pat
         state.auto_yaw_enabled = not state.auto_yaw_enabled
         state.dirty = True
         set_temp_status(state, "Auto-yaw ON" if state.auto_yaw_enabled else "Auto-yaw OFF")
+    elif key == ord("["):
+        state.telemetry_offset_ms -= 50.0
+        state.dirty = True
+        set_temp_status(state, f"Telemetry offset {state.telemetry_offset_ms:+.0f} ms")
+    elif key == ord("]"):
+        state.telemetry_offset_ms += 50.0
+        state.dirty = True
+        set_temp_status(state, f"Telemetry offset {state.telemetry_offset_ms:+.0f} ms")
     elif key == ord("s"):
         start_export(state, input_path, output_path)
     return True
@@ -1063,6 +1089,7 @@ def run() -> int:
         roll=args.roll,
         fov=clamp(args.fov, MIN_FOV, MAX_FOV),
         preset_idx=max(0, min(len(ASPECT_PRESETS) - 1, args.preset)),
+        telemetry_offset_ms=args.telemetry_offset_ms,
     )
 
     output_path = make_output_path(input_path, args.output)
@@ -1105,6 +1132,7 @@ def run() -> int:
     print("  z/x: manual roll -/+ 1 degree")
     print("  a: toggle auto-level (default ON)")
     print("  y: toggle auto-yaw course vectoring (default ON)")
+    print("  [ / ]: shift telemetry timing backward/forward 50 ms")
     print("  p: play/pause")
     print("  i: toggle on-screen info panel")
     print("  s: save full video from frame 0 using current effective view")
@@ -1117,7 +1145,8 @@ def run() -> int:
             if ok:
                 frame = next_frame
                 state.frame_idx += 1
-                update_auto_orientation(state, fps)
+                state.current_video_t_ms = get_video_time_ms(cap, state.frame_idx, fps)
+                update_auto_orientation(state, fps, state.current_video_t_ms)
                 state.dirty = True
             else:
                 state.paused = True
@@ -1130,7 +1159,7 @@ def run() -> int:
 
         if state.paused and state.telemetry_data.loaded:
             # Keep telemetry values aligned with currently displayed frame while paused.
-            update_auto_orientation(state, fps)
+            update_auto_orientation(state, fps, state.current_video_t_ms)
 
         if state.dirty or state.paused:
             display = render_frame(frame, state)
