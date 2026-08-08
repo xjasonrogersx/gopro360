@@ -5,9 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "gpmf>=0.1",
     "numpy>=2.5.1",
     "opencv-python>=5.0.0.93",
     "scipy>=1.18.0",
+    "telemetry-parser>=0.3.0",
 ]
 
 [project.scripts]

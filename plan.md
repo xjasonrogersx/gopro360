@@ -593,3 +593,119 @@ with open("360_video_workflow.md", "w") as f:
     f.write(markdown_content)
 
 ```
+
+
+## Gemini said
+
+The **GoPro Max** stores telemetry data directly inside the `.mp4` file using GoPro's proprietary **GPMF** (General Purpose Metadata Format) track.
+
+MD
+
+When you parse a GoPro Max `.mp4` file, you get specific sensor tags that are suited for leveling your river footage and controlling the yaw.
+
+### GoPro Max Specific GPMF Telemetry Tags
+
+GPMF Tag
+
+Name
+
+Description & Usage for Leveling
+
+**`CORI`**
+
+**Camera Orientation**
+
+**This is your primary stream.** It contains pre-calculated 3D orientation quaternions (w,x,y,z) fused onboard the GoPro Max at ~200 Hz. Inverting these values gives you frame-by-frame **Pitch** and **Roll** corrections to lock the horizon perfectly flat.
+
+**`GRAV`**
+
+**Gravity Vector**
+
+Provides a 3D unit vector (x,y,z) indicating the exact direction of gravity relative to the camera body at ~200 Hz. You can use this as an alternative to `CORI` to compute pitch (arcsin(y)) and roll (arctan2(x,z)).
+
+**`GYRO`**
+
+**Gyroscope**
+
+Raw 3-axis angular velocity (rad/s) sampled at ~200 Hz to ~400 Hz. Useful for applying a high-pass filter if you want to isolate and strip out sudden paddle hits or boat vibrations.
+
+**`ACCL`**
+
+**Accelerometer**
+
+Raw 3-axis acceleration (g\-force) sampled at ~200 Hz.
+
+**`GPS5`**
+
+**GPS Data**
+
+Outputs latitude, longitude, altitude, 2D ground speed, and 3D speed at 18 Hz.
+
+**`GPSU`**
+
+**GPS UTC Time**
+
+Microsecond-accurate UTC timestamps used to align telemetry samples precisely with your video's frame timestamps (`PTS`).
+
+### Extracting & Using GoPro Max Telemetry in Python
+
+You can extract the `CORI` or `GRAV` streams directly in Python using the open-source **`gpmf-parser`** or **`gpmf`** library.
+
+#### 1\. Installation
+
+Bash
+
+```
+pip install gpmf opencv-python numpy scipy
+```
+
+#### 2\. Extraction & Interpolation Script
+
+GoPro Max writes telemetry at ~200 Hz, but video runs at 30 or 60 FPS. This script extracts the GoPro `CORI` quaternions, converts them to Euler angles (Pitch/Roll), and interpolates them to match the exact timestamp of every video frame.
+
+Python
+
+```
+import gpmf
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+from scipy.interpolate import interp1d
+
+def extract_gopro_max_orientation(mp4_path, total_video_frames, fps):
+    # Extract GPMF stream from MP4 metadata track
+    gpmf_data = gpmf.parse(mp4_path)
+    
+    # Extract CORI (Camera Orientation Quaternions)
+    cori_data = gpmf.extract(gpmf_data, 'CORI')
+    
+    # Extract raw quaternions (w, x, y, z)
+    quats = np.array([sample['data'] for sample in cori_data])
+    
+    # Convert Quaternions to Pitch and Roll Euler angles (in degrees)
+    rotations = R.from_quat(quats) # GoPro uses [w, x, y, z] or [x, y, z, w] depending on parser
+    euler_angles = rotations.as_euler('xyz', degrees=True)
+    
+    raw_pitch = euler_angles[:, 0]
+    raw_roll  = euler_angles[:, 2]
+    
+    # Generate timestamp grids for interpolation
+    telemetry_time = np.linspace(0, total_video_frames / fps, len(quats))
+    frame_time = np.linspace(0, total_video_frames / fps, total_video_frames)
+    
+    # Interpolate pitch and roll to match video frames exactly
+    pitch_interp = interp1d(telemetry_time, raw_pitch, kind='cubic', fill_value="extrapolate")
+    roll_interp  = interp1d(telemetry_time, raw_roll,  kind='cubic', fill_value="extrapolate")
+    
+    return pitch_interp(frame_time), roll_interp(frame_time)
+```
+
+### How to Apply This to Your River Video
+
+1.  **Pitch & Roll (Leveling):** Pass the extracted `pitch_interp` and `roll_interp` arrays directly into your `build_equirect_rotation_map()` matrix function with inverted signs (`-pitch`, `-roll`). This keeps the water surface level even when your kayak or boat rolls side-to-side in rapids.
+    
+2.  **Yaw (Course Vectoring):**
+    
+    -   If you want the camera to automatically follow the bends of the river, calculate the **GPS Course Heading** from the `GPS5` stream (arctan2(ΔLon,ΔLat)) and apply it to the **Yaw** matrix.
+        
+    -   If you prefer manual camera control, define keyframe angles for the **Yaw** axis and smooth them using `scipy.interpolate.CubicSpline`.
+  
