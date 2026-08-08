@@ -480,8 +480,9 @@ def telemetry_horizon_line(
     v_fov_rad = 2.0 * math.atan(math.tan(h_fov_rad * 0.5) * (frame_h / max(frame_w, 1)))
     v_fov_deg = max(1e-6, math.degrees(v_fov_rad))
 
-    # Positive camera pitch moves horizon down in the image.
-    y_center = cy + ((pitch / v_fov_deg) * frame_h)
+    # Positive camera pitch now moves the horizon down in the image.
+    # The previous sign was inverted relative to the drag/view convention.
+    y_center = cy - ((pitch / v_fov_deg) * frame_h)
     slope = math.tan(math.radians(-roll))
 
     x0 = 0.0
@@ -499,6 +500,37 @@ def get_effective_angles(state: ViewerState) -> tuple[float, float, float]:
     pitch = state.pitch + (state.auto_pitch if state.auto_level_enabled else 0.0)
     roll = state.roll + (state.auto_roll if state.auto_level_enabled else 0.0)
     return wrap_angle_deg(yaw), clamp(pitch, -89.0, 89.0), wrap_angle_deg(roll)
+
+
+def compute_auto_terms_for_time(
+    telemetry_data: TelemetryData,
+    t_ms: float,
+    dt_ms: float,
+    auto_roll: float,
+    auto_pitch: float,
+    auto_yaw: float,
+    auto_level_enabled: bool,
+    auto_yaw_enabled: bool,
+) -> tuple[float, float, float]:
+    if not telemetry_data.loaded:
+        return auto_roll, auto_pitch, auto_yaw
+
+    imu = interpolate_imu_sample(telemetry_data.imu_samples, t_ms)
+    course = interpolate_course(telemetry_data.course_samples, t_ms)
+
+    if auto_level_enabled and imu is not None:
+        if imu.roll_deg is not None:
+            auto_roll = ((auto_roll * 0.85) + ((-imu.roll_deg) * 0.15))
+        if imu.pitch_deg is not None:
+            auto_pitch = ((auto_pitch * 0.85) + ((-imu.pitch_deg) * 0.15))
+
+    if auto_yaw_enabled:
+        if course is not None and course[1] >= 0.8:
+            auto_yaw = blend_angle_deg(auto_yaw, course[0], 0.12)
+        elif imu is not None and imu.yaw_rate_dps is not None:
+            auto_yaw = wrap_angle_deg(auto_yaw + (imu.yaw_rate_dps * (dt_ms / 1000.0)))
+
+    return auto_roll, auto_pitch, auto_yaw
 
 
 def build_remap(
@@ -715,12 +747,20 @@ def draw_overlay(frame: np.ndarray, state: ViewerState, fps: float, total_frames
 def draw_horizon_line(frame: np.ndarray, state: ViewerState) -> None:
     if not state.telemetry_data.loaded:
         return
+
+    # Draw the telemetry horizon as it appears in the current view.
+    # Raw telemetry tilt is combined with the current effective camera tilt,
+    # so dragging pitch/roll (or auto-level) updates the overlay line.
+    _, eff_pitch, eff_roll = get_effective_angles(state)
+    telemetry_roll = state.telemetry_frame.roll_deg or 0.0
+    telemetry_pitch = state.telemetry_frame.pitch_deg or 0.0
+
     p0, p1 = telemetry_horizon_line(
         frame_w=frame.shape[1],
         frame_h=frame.shape[0],
         h_fov_deg=state.fov,
-        telemetry_roll_deg=state.telemetry_frame.roll_deg,
-        telemetry_pitch_deg=state.telemetry_frame.pitch_deg,
+        telemetry_roll_deg=telemetry_roll + eff_roll,
+        telemetry_pitch_deg=telemetry_pitch + eff_pitch,
     )
     cv2.line(frame, p0, p1, HORIZON_COLOR, 2, cv2.LINE_AA)
 
@@ -756,11 +796,17 @@ def create_writer(path: Path, fps: float, size: tuple[int, int]) -> tuple[cv2.Vi
 def run_export(
     input_path: Path,
     output_path: Path,
-    yaw: float,
-    pitch: float,
-    roll: float,
+    manual_yaw: float,
+    manual_pitch: float,
+    manual_roll: float,
     fov: float,
     preset_idx: int,
+    telemetry_data: TelemetryData,
+    auto_level_enabled: bool,
+    auto_yaw_enabled: bool,
+    auto_roll_seed: float,
+    auto_pitch_seed: float,
+    auto_yaw_seed: float,
     status: ExportStatus,
     lock: threading.Lock,
 ) -> None:
@@ -791,19 +837,16 @@ def run_export(
             status.active = False
         return
 
-    map_x, map_y = build_remap(
-        in_h=src_h,
-        in_w=src_w,
-        out_h=out_h,
-        out_w=out_w,
-        yaw_deg=yaw,
-        pitch_deg=pitch,
-        roll_deg=roll,
-        fov_deg=fov,
-    )
+    auto_roll = auto_roll_seed
+    auto_pitch = auto_pitch_seed
+    auto_yaw = auto_yaw_seed
+    last_t_ms: float | None = None
 
     print(f"Export started -> {output_path}")
-    print(f"Codec: {codec_label} | Size: {out_w}x{out_h} | FPS: {fps:.3f}")
+    print(
+        f"Codec: {codec_label} | Size: {out_w}x{out_h} | FPS: {fps:.3f} | "
+        f"auto-level={'on' if auto_level_enabled else 'off'} auto-yaw={'on' if auto_yaw_enabled else 'off'}"
+    )
 
     processed = 0
     started = time.time()
@@ -815,6 +858,36 @@ def run_export(
         ok, frame = cap.read()
         if not ok:
             break
+
+        t_ms = (processed / max(fps, 1e-6)) * 1000.0
+        dt_ms = 0.0 if last_t_ms is None else max(0.0, t_ms - last_t_ms)
+        auto_roll, auto_pitch, auto_yaw = compute_auto_terms_for_time(
+            telemetry_data=telemetry_data,
+            t_ms=t_ms,
+            dt_ms=dt_ms,
+            auto_roll=auto_roll,
+            auto_pitch=auto_pitch,
+            auto_yaw=auto_yaw,
+            auto_level_enabled=auto_level_enabled,
+            auto_yaw_enabled=auto_yaw_enabled,
+        )
+        last_t_ms = t_ms
+
+        yaw = wrap_angle_deg(manual_yaw + (auto_yaw if auto_yaw_enabled else 0.0))
+        pitch = clamp(manual_pitch + (auto_pitch if auto_level_enabled else 0.0), -89.0, 89.0)
+        roll = wrap_angle_deg(manual_roll + (auto_roll if auto_level_enabled else 0.0))
+
+        map_x, map_y = build_remap(
+            in_h=src_h,
+            in_w=src_w,
+            out_h=out_h,
+            out_w=out_w,
+            yaw_deg=yaw,
+            pitch_deg=pitch,
+            roll_deg=roll,
+            fov_deg=fov,
+        )
+
         dewarped = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
         writer.write(dewarped)
         processed += 1
@@ -870,8 +943,6 @@ def start_export(state: ViewerState, input_path: Path, output_path: Path) -> Non
             state.status_until = time.time() + 2.0
             return
 
-        eff_yaw, eff_pitch, eff_roll = get_effective_angles(state)
-
         state.export_status = ExportStatus(
             active=True,
             done=False,
@@ -888,11 +959,17 @@ def start_export(state: ViewerState, input_path: Path, output_path: Path) -> Non
             args=(
                 input_path,
                 output_path,
-                eff_yaw,
-                eff_pitch,
-                eff_roll,
+                state.yaw,
+                state.pitch,
+                state.roll,
                 state.fov,
                 state.preset_idx,
+                state.telemetry_data,
+                state.auto_level_enabled,
+                state.auto_yaw_enabled,
+                state.auto_roll,
+                state.auto_pitch,
+                state.auto_yaw,
                 state.export_status,
                 state.export_lock,
             ),
