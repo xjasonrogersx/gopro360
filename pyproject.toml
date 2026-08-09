@@ -7,8 +7,11 @@ requires-python = ">=3.12"
 dependencies = [
     "gpmf>=0.1",
     "numpy>=2.5.1",
+    "onnxruntime>=1.28.0",
+    "onnxscript>=0.7.1",
     "opencv-python>=5.0.0.93",
     "py-gpmf-parser>=0.1.1",
+    "raft>=1.6",
     "scipy>=1.18.0",
     "torch>=2.13.0",
 ]

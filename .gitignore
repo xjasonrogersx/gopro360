@@ -2,3 +2,5 @@
 *.mov
 __pycache__/viewer-telemetry.cpython-312.pyc
 __pycache__/viewer-gpmf.cpython-312.pyc
+raft/raft_light_small_360x480.onnx
+.gitignore
