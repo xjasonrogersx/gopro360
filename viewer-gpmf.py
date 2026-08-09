@@ -200,7 +200,12 @@ def load_gpmf_telemetry(video_path: Path, total_frames: int) -> TelemetryData:
 					if quats.shape[1] != 4 and quats.shape[0] == 4:
 						quats = quats.T
 					if quats.shape[1] == 4:
-						rot = R.from_quat(quats)
+						# GoPro CORI is commonly w,x,y,z while SciPy expects x,y,z,w.
+						if float(np.mean(np.abs(quats[:, 0]))) > float(np.mean(np.abs(quats[:, 3]))):
+							quats_xyzw = np.column_stack((quats[:, 1], quats[:, 2], quats[:, 3], quats[:, 0]))
+						else:
+							quats_xyzw = quats
+						rot = R.from_quat(quats_xyzw)
 						eulers = rot.as_euler("xyz", degrees=True)
 						telemetry.pitch_deg = interpolate_series(eulers[:, 0], total_frames)
 						telemetry.roll_deg = interpolate_series(eulers[:, 2], total_frames)
