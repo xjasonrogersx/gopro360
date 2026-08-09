@@ -9,6 +9,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from py_gpmf_parser.gopro_telemetry_extractor import GoProTelemetryExtractor
+from scipy.interpolate import interp1d
+from scipy.spatial.transform import Rotation as R
 
 
 WINDOW_NAME = "gopro360 viewer"
@@ -35,6 +38,22 @@ class ExportStatus:
 
 
 @dataclass
+class TelemetryData:
+	pitch_deg: np.ndarray | None = None
+	roll_deg: np.ndarray | None = None
+	gps_heading_deg: np.ndarray | None = None
+	grav: np.ndarray | None = None
+	grav_timestamps: np.ndarray | None = None
+	cori: np.ndarray | None = None
+	cori_timestamps: np.ndarray | None = None
+	shut: np.ndarray | None = None
+	shut_timestamps: np.ndarray | None = None
+	isoe: np.ndarray | None = None
+	isoe_timestamps: np.ndarray | None = None
+	source: str = "none"
+
+
+@dataclass
 class ViewerState:
 	yaw: float
 	pitch: float
@@ -53,6 +72,9 @@ class ViewerState:
 	map_key: tuple | None = None
 	map_x: np.ndarray | None = None
 	map_y: np.ndarray | None = None
+	telemetry: TelemetryData = field(default_factory=TelemetryData)
+	use_auto_level: bool = True
+	yaw_mode: str = "manual"
 	export_lock: threading.Lock = field(default_factory=threading.Lock)
 	export_status: ExportStatus = field(default_factory=ExportStatus)
 	export_thread: threading.Thread | None = None
@@ -86,6 +108,165 @@ def clamp(value: float, low: float, high: float) -> float:
 def round_even(value: float) -> int:
 	rounded = int(round(value))
 	return rounded if rounded % 2 == 0 else rounded - 1
+
+
+def wrap_angle(angle_deg: float) -> float:
+	wrapped = (angle_deg + 180.0) % 360.0 - 180.0
+	return wrapped
+
+
+def _coerce_array(payload: object) -> np.ndarray | None:
+	if payload is None:
+		return None
+	try:
+		array = np.asarray(payload, dtype=np.float32)
+	except Exception:
+		return None
+	if array.size == 0:
+		return None
+	return array
+
+
+def _normalize_stream_samples(payload: object) -> np.ndarray | None:
+	array = _coerce_array(payload)
+	if array is None:
+		return None
+	if array.ndim == 1:
+		return array.reshape(-1, 1)
+	if array.ndim == 2:
+		return array
+	return array.reshape(array.shape[0], -1)
+
+
+def _normalize_timestamps(payload: object, expected_len: int) -> np.ndarray | None:
+	array = _coerce_array(payload)
+	if array is None:
+		return None
+	timestamps = array.reshape(-1).astype(np.float32)
+	if timestamps.size == expected_len:
+		return timestamps
+	if timestamps.size == 1 and expected_len > 1:
+		return np.linspace(float(timestamps[0]), float(timestamps[0]), expected_len, dtype=np.float32)
+	if timestamps.size > 1 and expected_len > 1:
+		source_t = np.linspace(0.0, 1.0, timestamps.size, dtype=np.float32)
+		target_t = np.linspace(0.0, 1.0, expected_len, dtype=np.float32)
+		return np.interp(target_t, source_t, timestamps).astype(np.float32)
+	return None
+
+
+def interpolate_series(values: np.ndarray | None, total_frames: int) -> np.ndarray | None:
+	if values is None or values.size == 0:
+		return None
+	values = np.asarray(values, dtype=np.float32)
+	if total_frames <= 0:
+		return values[:1].copy()
+	if values.size == 1:
+		return np.full(total_frames, values[0], dtype=np.float32)
+	source_t = np.linspace(0.0, max(total_frames - 1, 1), values.size)
+	frame_t = np.arange(total_frames, dtype=np.float32)
+	interp = interp1d(source_t, values, kind="linear", bounds_error=False, fill_value=(values[0], values[-1]))
+	return interp(frame_t).astype(np.float32)
+
+
+def load_gpmf_telemetry(video_path: Path, total_frames: int) -> TelemetryData:
+	telemetry = TelemetryData()
+	source_parts: list[str] = []
+
+	extractor = GoProTelemetryExtractor(str(video_path))
+	try:
+		extractor.open_source()
+		for key in ("GRAV", "CORI", "SHUT", "ISOE"):
+			try:
+				stream_data, timestamps = extractor.extract_data(key)
+			except Exception:
+				continue
+
+			samples = _normalize_stream_samples(stream_data)
+			if samples is None or samples.shape[0] == 0:
+				continue
+
+			ts = _normalize_timestamps(timestamps, samples.shape[0])
+			if key == "GRAV":
+				telemetry.grav = samples.astype(np.float32)
+				telemetry.grav_timestamps = ts
+				source_parts.append("grav")
+			elif key == "CORI":
+				telemetry.cori = samples.astype(np.float32)
+				telemetry.cori_timestamps = ts
+				source_parts.append("cori")
+
+				quats = telemetry.cori
+				if quats is not None and quats.size > 0:
+					if quats.shape[1] != 4 and quats.shape[0] == 4:
+						quats = quats.T
+					if quats.shape[1] == 4:
+						rot = R.from_quat(quats)
+						eulers = rot.as_euler("xyz", degrees=True)
+						telemetry.pitch_deg = interpolate_series(eulers[:, 0], total_frames)
+						telemetry.roll_deg = interpolate_series(eulers[:, 2], total_frames)
+			elif key == "SHUT":
+				telemetry.shut = samples.astype(np.float32)
+				telemetry.shut_timestamps = ts
+				source_parts.append("shut")
+			elif key == "ISOE":
+				telemetry.isoe = samples.astype(np.float32)
+				telemetry.isoe_timestamps = ts
+				source_parts.append("isoe")
+	finally:
+		try:
+			extractor.close_source()
+		except Exception:
+			pass
+
+	telemetry.source = "+".join(dict.fromkeys(source_parts)) if source_parts else "none"
+	return telemetry
+
+
+def sample_series(values: np.ndarray | None, frame_idx: int) -> float:
+	if values is None or values.size == 0:
+		return 0.0
+	idx = min(max(frame_idx, 0), values.size - 1)
+	return float(values[idx])
+
+
+def sample_stream_at_time(values: np.ndarray | None, timestamps: np.ndarray | None, t_sec: float) -> np.ndarray | None:
+	if values is None or values.size == 0:
+		return None
+	if timestamps is None or timestamps.size == 0:
+		idx = min(max(int(round(t_sec)), 0), values.shape[0] - 1)
+		return values[idx]
+
+	idx = int(np.searchsorted(timestamps, t_sec, side="left"))
+	if idx <= 0:
+		return values[0]
+	if idx >= timestamps.size:
+		return values[-1]
+
+	prev_idx = idx - 1
+	if abs(float(timestamps[idx]) - t_sec) < abs(float(timestamps[prev_idx]) - t_sec):
+		return values[idx]
+	return values[prev_idx]
+
+
+def format_sample(values: np.ndarray | None, decimals: int = 4) -> str:
+	if values is None or values.size == 0:
+		return "n/a"
+	return np.array2string(values.astype(np.float32), precision=decimals, separator=",", suppress_small=False)
+
+
+def get_effective_orientation(state: "ViewerState", frame_idx: int) -> tuple[float, float, float]:
+	yaw_deg = state.yaw
+	pitch_deg = state.pitch
+	roll_deg = state.roll
+
+	if state.use_auto_level:
+		pitch_deg = state.pitch - sample_series(state.telemetry.pitch_deg, frame_idx)
+		roll_deg = state.roll - sample_series(state.telemetry.roll_deg, frame_idx)
+
+	if state.yaw_mode == "gps":
+		yaw_deg = state.yaw + sample_series(state.telemetry.gps_heading_deg, frame_idx)
+
+	return yaw_deg, pitch_deg, roll_deg
 
 
 def build_remap(
@@ -154,16 +335,20 @@ def build_remap(
 	return map_x.astype(np.float32), map_y.astype(np.float32)
 
 
-def get_cached_remap(state: ViewerState, in_h: int, in_w: int, out_h: int, out_w: int) -> tuple[np.ndarray, np.ndarray]:
+def get_cached_remap(state: ViewerState, in_h: int, in_w: int, out_h: int, out_w: int, frame_idx: int) -> tuple[np.ndarray, np.ndarray]:
+	yaw_deg, pitch_deg, roll_deg = get_effective_orientation(state, frame_idx)
 	key = (
 		in_h,
 		in_w,
 		out_h,
 		out_w,
-		round(state.yaw, 4),
-		round(state.pitch, 4),
-		round(state.roll, 4),
+		round(yaw_deg, 4),
+		round(pitch_deg, 4),
+		round(roll_deg, 4),
 		round(state.fov, 4),
+		frame_idx,
+		state.use_auto_level,
+		state.yaw_mode,
 	)
 	if state.map_key != key or state.map_x is None or state.map_y is None:
 		state.map_x, state.map_y = build_remap(
@@ -171,9 +356,9 @@ def get_cached_remap(state: ViewerState, in_h: int, in_w: int, out_h: int, out_w
 			in_w=in_w,
 			out_h=out_h,
 			out_w=out_w,
-			yaw_deg=state.yaw,
-			pitch_deg=state.pitch,
-			roll_deg=state.roll,
+			yaw_deg=yaw_deg,
+			pitch_deg=pitch_deg,
+			roll_deg=roll_deg,
 			fov_deg=state.fov,
 		)
 		state.map_key = key
@@ -183,8 +368,18 @@ def get_cached_remap(state: ViewerState, in_h: int, in_w: int, out_h: int, out_w
 def render_frame(frame: np.ndarray, state: ViewerState) -> np.ndarray:
 	_, out_w, out_h = ASPECT_PRESETS[state.preset_idx]
 	in_h, in_w = frame.shape[:2]
-	map_x, map_y = get_cached_remap(state, in_h, in_w, out_h, out_w)
+	map_x, map_y = get_cached_remap(state, in_h, in_w, out_h, out_w, state.frame_idx)
 	return cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+
+
+def draw_horizon_overlay(frame: np.ndarray, state: ViewerState) -> None:
+	h, w = frame.shape[:2]
+	yaw_deg, pitch_deg, roll_deg = get_effective_orientation(state, state.frame_idx)
+	horizon_y = (h / 2.0) - (pitch_deg * (h / 180.0))
+	slope = math.tan(math.radians(roll_deg)) * (w / 2.0)
+	y0 = int(np.clip(horizon_y - slope, 0, h - 1))
+	y1 = int(np.clip(horizon_y + slope, 0, h - 1))
+	cv2.line(frame, (0, y0), (w - 1, y1), (0, 255, 255), 2, cv2.LINE_AA)
 
 
 def draw_overlay(frame: np.ndarray, state: ViewerState, fps: float, total_frames: int) -> None:
@@ -193,14 +388,24 @@ def draw_overlay(frame: np.ndarray, state: ViewerState, fps: float, total_frames
 
 	label, out_w, out_h = ASPECT_PRESETS[state.preset_idx]
 	play_state = "paused" if state.paused else "playing"
+	level_status = "auto-level on" if state.use_auto_level else "auto-level off"
+	yaw_status = "yaw=gps" if state.yaw_mode == "gps" else "yaw=manual"
 	line1 = f"{play_state} frame={state.frame_idx}/{max(total_frames - 1, 0)}  fps={fps:.2f}"
 	line2 = (
 		f"yaw={state.yaw:.1f} pitch={state.pitch:.1f} roll={state.roll:.1f} "
 		f"fov={state.fov:.1f} preset={label} {out_w}x{out_h}"
 	)
-	line3 = "drag=pan/tilt wheel=fov z/x=roll r=aspect p=play/pause s=save i=info q/esc=quit"
+	line3 = f"{level_status} | {yaw_status} | telemetry={state.telemetry.source or 'none'}"
+	time_sec = state.frame_idx / max(fps, 1e-6)
+	grav_value = sample_stream_at_time(state.telemetry.grav, state.telemetry.grav_timestamps, time_sec)
+	cori_value = sample_stream_at_time(state.telemetry.cori, state.telemetry.cori_timestamps, time_sec)
+	shut_value = sample_stream_at_time(state.telemetry.shut, state.telemetry.shut_timestamps, time_sec)
+	isoe_value = sample_stream_at_time(state.telemetry.isoe, state.telemetry.isoe_timestamps, time_sec)
+	line4 = f"t={time_sec:.3f}s GRAV={format_sample(grav_value, 5)} CORI={format_sample(cori_value, 5)}"
+	line5 = f"SHUT={format_sample(shut_value, 7)} ISOE={format_sample(isoe_value, 2)}"
+	line6 = "drag=pan/tilt wheel=fov z/x=roll a=level y=yaw-mode r=aspect p=play/pause s=save i=info q/esc=quit"
 
-	panel_lines = [line1, line2, line3]
+	panel_lines = [line1, line2, line3, line4, line5, line6]
 	font = cv2.FONT_HERSHEY_SIMPLEX
 	font_scale = 0.58
 	thickness = 1
@@ -274,6 +479,9 @@ def run_export(
 	roll: float,
 	fov: float,
 	preset_idx: int,
+	use_auto_level: bool,
+	yaw_mode: str,
+	telemetry: TelemetryData,
 	status: ExportStatus,
 	lock: threading.Lock,
 ) -> None:
@@ -304,17 +512,6 @@ def run_export(
 			status.active = False
 		return
 
-	map_x, map_y = build_remap(
-		in_h=src_h,
-		in_w=src_w,
-		out_h=out_h,
-		out_w=out_w,
-		yaw_deg=yaw,
-		pitch_deg=pitch,
-		roll_deg=roll,
-		fov_deg=fov,
-	)
-
 	print(f"Export started -> {output_path}")
 	print(f"Codec: {codec_label} | Size: {out_w}x{out_h} | FPS: {fps:.3f}")
 
@@ -328,6 +525,20 @@ def run_export(
 		ok, frame = cap.read()
 		if not ok:
 			break
+		effective_yaw, effective_pitch, effective_roll = get_effective_orientation(
+			ViewerState(yaw=yaw, pitch=pitch, roll=roll, fov=fov, preset_idx=preset_idx, telemetry=telemetry, use_auto_level=use_auto_level, yaw_mode=yaw_mode),
+			processed,
+		)
+		map_x, map_y = build_remap(
+			in_h=src_h,
+			in_w=src_w,
+			out_h=out_h,
+			out_w=out_w,
+			yaw_deg=effective_yaw,
+			pitch_deg=effective_pitch,
+			roll_deg=effective_roll,
+			fov_deg=fov,
+		)
 		dewarped = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
 		writer.write(dewarped)
 		processed += 1
@@ -408,6 +619,9 @@ def start_export(state: ViewerState, input_path: Path, output_path: Path) -> Non
 				state.roll,
 				state.fov,
 				state.preset_idx,
+				state.use_auto_level,
+				state.yaw_mode,
+				state.telemetry,
 				state.export_status,
 				state.export_lock,
 			),
@@ -467,6 +681,14 @@ def process_key(key: int, state: ViewerState, input_path: Path, output_path: Pat
 		state.roll += 1.0
 		state.dirty = True
 		set_temp_status(state, f"Roll {state.roll:.1f}")
+	elif key == ord("a"):
+		state.use_auto_level = not state.use_auto_level
+		state.dirty = True
+		set_temp_status(state, "Auto-level on" if state.use_auto_level else "Auto-level off")
+	elif key == ord("y"):
+		state.yaw_mode = "gps" if state.yaw_mode != "gps" else "manual"
+		state.dirty = True
+		set_temp_status(state, "Yaw: GPS" if state.yaw_mode == "gps" else "Yaw: manual")
 	elif key == ord("p"):
 		state.paused = not state.paused
 		state.dirty = True
@@ -504,6 +726,11 @@ def run() -> int:
 
 	fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 	total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+	state.telemetry = load_gpmf_telemetry(input_path, max(total_frames, 1))
+	if state.telemetry.source != "none":
+		print(f"Loaded GPMF telemetry ({state.telemetry.source})")
+	else:
+		print("No GPMF telemetry found; continuing with manual controls")
 
 	ok, frame = cap.read()
 	if not ok:
@@ -525,6 +752,8 @@ def run() -> int:
 	print("  mouse wheel: adjust FOV")
 	print("  r: cycle preview aspect preset")
 	print("  z/x: roll -/+ 1 degree")
+	print("  a: toggle auto-level from CORI telemetry")
+	print("  y: toggle yaw mode (manual / GPS)")
 	print("  p: play/pause")
 	print("  i: toggle on-screen info panel")
 	print("  s: save full video from frame 0 using current settings")
@@ -549,6 +778,7 @@ def run() -> int:
 
 		if state.dirty or state.paused:
 			display = render_frame(frame, state)
+			draw_horizon_overlay(display, state)
 			draw_overlay(display, state, fps, total_frames)
 
 			with state.export_lock:

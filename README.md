@@ -52,6 +52,69 @@ uv run python viewer-telemetry.py /path/to/input_with_telemetry.mov
 - Export prints progress in terminal and overlays export status in the viewer.
 - Export target is MP4; writer prefers H.264 and falls back to mp4v if needed.
 
+
+## Telemetry
+
+My steams have the following data that can be extrated with y_gpmf_parser  ( https://github.com/gopro/gpmf-parser )
+
+
+```
+(gopro360) jason@laptop:~/work/gopro360$ uv run dump_gpmf.py 
+=== Extraction Summary for GS010014-eqr-prores-telemetry.mov ===
+
+✅ Found 'ACCL' stream:
+   • Total Samples : 842
+   • Time Range    : -0.0038s to 28.0518s
+   • First Sample  : [ 9.81294964 -0.50359712 -0.76738609]
+   • Last Sample   : [ 9.83453237 -0.07913669 -0.86330935]
+✅ Found 'GYRO' stream:
+   • Total Samples : 842
+   • Time Range    : -0.0038s to 28.0519s
+   • First Sample  : [ 0.04898829 -0.00106496  0.02981896]
+   • Last Sample   : [ 0.0543131   0.         -0.01277955]
+⚠️  Stream 'GPS5': Present in schema but contains 0 samples.
+✅ Found 'GPS9' stream:
+   • Total Samples : 841
+   • Time Range    : 0.0199s to 28.0755s
+   • First Sample  : [ 0.00000e+00  0.00000e+00 -1.70000e+01  0.00000e+00  0.00000e+00
+  7.73700e+03  2.25165e+04  9.99900e+01  0.00000e+00]
+   • Last Sample   : [ 5.19068105e+01 -2.62023280e+00  3.10580000e+01  1.62300000e+00
+  1.52000000e+00  9.70400000e+03  2.27966000e+04  2.41000000e+00
+  3.00000000e+00]
+✅ Found 'GRAV' stream:
+   • Total Samples : 841
+   • Time Range    : 0.0000s to 28.0223s
+   • First Sample  : [-0.05499435  0.99526963 -0.07986694]
+   • Last Sample   : [-0.01895199  0.99682608 -0.07727287]
+✅ Found 'CORI' stream:
+   • Total Samples : 841
+   • Time Range    : 0.0000s to 28.0223s
+   • First Sample  : [1.00000000e+00 0.00000000e+00 1.09866634e-03 7.32444227e-04]
+   • Last Sample   : [ 0.66109195 -0.141789    0.72264779 -0.14371166]
+✅ Found 'SHUT' stream:
+   • Total Samples : 841
+   • Time Range    : 0.0000s to 28.0223s
+   • First Sample  : [0.00082077]
+   • Last Sample   : [0.00072911]
+✅ Found 'ISOE' stream:
+   • Total Samples : 841
+   • Time Range    : 0.0000s to 28.0223s
+   • First Sample  : [100.]
+   • Last Sample   : [100.]
+```
+detalis aout GPMF can be found https://github.com/gopro/gpmf-parser
+
+
+
+
+
+
+
+
+
+
+
+
 ## Telemetry Viewer
 
 ![alt text](images/image-tv.png)
