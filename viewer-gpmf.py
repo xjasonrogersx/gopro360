@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from py_gpmf_parser.gopro_telemetry_extractor import GoProTelemetryExtractor
-from scipy.interpolate import interp1d
+from scipy.interpolate import CubicSpline, interp1d
 from scipy.spatial.transform import Rotation as R
 
 
@@ -23,6 +23,7 @@ ASPECT_PRESETS = [
 	("9:16", 1080, 1920),
 	("4:3", 1440, 1080),
 ]
+DEFAULT_RAFT_ONNX = Path(__file__).resolve().parent / "raft" / "raft_light_small_360x480.onnx"
 
 
 @dataclass
@@ -42,6 +43,7 @@ class TelemetryData:
 	pitch_deg: np.ndarray | None = None
 	roll_deg: np.ndarray | None = None
 	gps_heading_deg: np.ndarray | None = None
+	flow_heading_deg: np.ndarray | None = None
 	grav: np.ndarray | None = None
 	grav_timestamps: np.ndarray | None = None
 	cori: np.ndarray | None = None
@@ -97,6 +99,11 @@ def parse_args() -> argparse.Namespace:
 		type=int,
 		default=1,
 		help="Initial aspect preset index: 0=1:1, 1=16:9, 2=9:16, 3=4:3",
+	)
+	parser.add_argument(
+		"--raft-onnx",
+		default=str(DEFAULT_RAFT_ONNX),
+		help="Path to RAFT ONNX model used for optical-flow yaw when GPS heading is unavailable",
 	)
 	return parser.parse_args()
 
@@ -227,6 +234,120 @@ def load_gpmf_telemetry(video_path: Path, total_frames: int) -> TelemetryData:
 	return telemetry
 
 
+def build_raft_blob(frame: np.ndarray, input_h: int, input_w: int) -> np.ndarray:
+	resized = cv2.resize(frame, (input_w, input_h), interpolation=cv2.INTER_AREA)
+	rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+	blob = np.transpose(rgb.astype(np.float32), (2, 0, 1))[None, ...]
+	return blob
+
+
+def extract_flow_x(flow_output: np.ndarray) -> np.ndarray | None:
+	if flow_output.ndim == 4:
+		flow = flow_output[0]
+		if flow.shape[0] == 2:
+			return flow[0]
+	if flow_output.ndim == 3:
+		if flow_output.shape[0] == 2:
+			return flow_output[0]
+		if flow_output.shape[-1] == 2:
+			return flow_output[..., 0]
+	if flow_output.ndim == 2:
+		return flow_output
+	return None
+
+
+def compute_flow_heading_series(video_path: Path, total_frames: int, raft_onnx_path: Path) -> np.ndarray | None:
+	if total_frames < 2 or not raft_onnx_path.exists():
+		return None
+
+	try:
+		net = cv2.dnn.readNetFromONNX(str(raft_onnx_path))
+	except Exception:
+		return None
+
+	input_h, input_w = 360, 480
+	cap = cv2.VideoCapture(str(video_path))
+	if not cap.isOpened():
+		return None
+
+	print(f"Computing RAFT flow yaw ({total_frames} frames)...")
+
+	ok, prev_frame = cap.read()
+	if not ok:
+		cap.release()
+		return None
+
+	frame_indices: list[int] = [0]
+	yaw_points: list[float] = [0.0]
+	cumulative_yaw = 0.0
+	last_progress_print = 0.0
+
+	for frame_idx in range(1, total_frames):
+		ok, frame = cap.read()
+		if not ok:
+			break
+
+		now = time.time()
+		if frame_idx == 1 or now - last_progress_print >= 0.25 or frame_idx == total_frames - 1:
+			pct = 100.0 * (frame_idx / max(total_frames - 1, 1))
+			print(f"\rRAFT flow yaw: {frame_idx}/{total_frames - 1} ({pct:5.1f}%)", end="", flush=True)
+			last_progress_print = now
+
+		blob1 = build_raft_blob(prev_frame, input_h, input_w)
+		blob2 = build_raft_blob(frame, input_h, input_w)
+
+		try:
+			net.setInput(blob1, "image1")
+			net.setInput(blob2, "image2")
+			flow_output = net.forward("optical_flow")
+		except Exception:
+			try:
+				net.setInput(blob1)
+				flow_output = net.forward()
+			except Exception:
+				prev_frame = frame
+				continue
+
+		flow_x = extract_flow_x(flow_output)
+		if flow_x is None or flow_x.size == 0:
+			prev_frame = frame
+			continue
+
+		h, w = flow_x.shape[:2]
+		center_band = flow_x[h // 3 : (2 * h) // 3, w // 6 : (5 * w) // 6]
+		if center_band.size == 0:
+			prev_frame = frame
+			continue
+
+		dx = float(np.median(center_band))
+		delta_yaw = clamp(-dx * (360.0 / float(input_w)), -8.0, 8.0)
+		cumulative_yaw += delta_yaw
+		frame_indices.append(frame_idx)
+		yaw_points.append(cumulative_yaw)
+		prev_frame = frame
+
+	cap.release()
+	print()
+
+	if len(frame_indices) < 2:
+		print("RAFT flow yaw failed: insufficient valid flow samples")
+		return None
+
+	x = np.asarray(frame_indices, dtype=np.float32)
+	y = np.asarray(yaw_points, dtype=np.float32)
+	target_x = np.arange(total_frames, dtype=np.float32)
+
+	if len(frame_indices) >= 4:
+		spline = CubicSpline(x, y, bc_type="natural")
+		smoothed = spline(target_x).astype(np.float32)
+	else:
+		smoothed = np.interp(target_x, x, y).astype(np.float32)
+
+	print(f"RAFT flow yaw ready: {len(frame_indices)} sampled frames")
+
+	return smoothed
+
+
 def sample_series(values: np.ndarray | None, frame_idx: int) -> float:
 	if values is None or values.size == 0:
 		return 0.0
@@ -270,8 +391,27 @@ def get_effective_orientation(state: "ViewerState", frame_idx: int) -> tuple[flo
 
 	if state.yaw_mode == "gps":
 		yaw_deg = state.yaw + sample_series(state.telemetry.gps_heading_deg, frame_idx)
+	elif state.yaw_mode == "flow":
+		yaw_deg = state.yaw + sample_series(state.telemetry.flow_heading_deg, frame_idx)
 
 	return yaw_deg, pitch_deg, roll_deg
+
+
+def available_yaw_modes(telemetry: TelemetryData) -> list[str]:
+	modes = ["manual"]
+	if telemetry.gps_heading_deg is not None and telemetry.gps_heading_deg.size > 0:
+		modes.append("gps")
+	if telemetry.flow_heading_deg is not None and telemetry.flow_heading_deg.size > 0:
+		modes.append("flow")
+	return modes
+
+
+def yaw_mode_label(yaw_mode: str) -> str:
+	if yaw_mode == "gps":
+		return "yaw=gps"
+	if yaw_mode == "flow":
+		return "yaw=flow"
+	return "yaw=manual"
 
 
 def build_remap(
@@ -394,7 +534,7 @@ def draw_overlay(frame: np.ndarray, state: ViewerState, fps: float, total_frames
 	label, out_w, out_h = ASPECT_PRESETS[state.preset_idx]
 	play_state = "paused" if state.paused else "playing"
 	level_status = "auto-level on" if state.use_auto_level else "auto-level off"
-	yaw_status = "yaw=gps" if state.yaw_mode == "gps" else "yaw=manual"
+	yaw_status = yaw_mode_label(state.yaw_mode)
 	line1 = f"{play_state} frame={state.frame_idx}/{max(total_frames - 1, 0)}  fps={fps:.2f}"
 	line2 = (
 		f"yaw={state.yaw:.1f} pitch={state.pitch:.1f} roll={state.roll:.1f} "
@@ -691,9 +831,11 @@ def process_key(key: int, state: ViewerState, input_path: Path, output_path: Pat
 		state.dirty = True
 		set_temp_status(state, "Auto-level on" if state.use_auto_level else "Auto-level off")
 	elif key == ord("y"):
-		state.yaw_mode = "gps" if state.yaw_mode != "gps" else "manual"
+		modes = available_yaw_modes(state.telemetry)
+		current_idx = modes.index(state.yaw_mode) if state.yaw_mode in modes else 0
+		state.yaw_mode = modes[(current_idx + 1) % len(modes)]
 		state.dirty = True
-		set_temp_status(state, "Yaw: GPS" if state.yaw_mode == "gps" else "Yaw: manual")
+		set_temp_status(state, f"Yaw: {state.yaw_mode}")
 	elif key == ord("p"):
 		state.paused = not state.paused
 		state.dirty = True
@@ -732,10 +874,26 @@ def run() -> int:
 	fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 	total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 	state.telemetry = load_gpmf_telemetry(input_path, max(total_frames, 1))
+	if state.telemetry.gps_heading_deg is None:
+		print("No GPS heading found in GPMF telemetry")
+		raft_onnx_path = Path(args.raft_onnx)
+		flow_heading = compute_flow_heading_series(input_path, max(total_frames, 1), raft_onnx_path)
+		if flow_heading is not None:
+			state.telemetry.flow_heading_deg = flow_heading
+			if state.telemetry.source == "none":
+				state.telemetry.source = "flow"
+			else:
+				state.telemetry.source = f"{state.telemetry.source}+flow"
+			print(f"Loaded RAFT flow yaw from {raft_onnx_path}")
+		else:
+			print("No GPS heading and RAFT flow yaw unavailable; yaw stays manual")
 	if state.telemetry.source != "none":
 		print(f"Loaded GPMF telemetry ({state.telemetry.source})")
 	else:
 		print("No GPMF telemetry found; continuing with manual controls")
+
+	if state.telemetry.gps_heading_deg is None and state.telemetry.flow_heading_deg is not None:
+		state.yaw_mode = "flow"
 
 	ok, frame = cap.read()
 	if not ok:
@@ -758,7 +916,7 @@ def run() -> int:
 	print("  r: cycle preview aspect preset")
 	print("  z/x: roll -/+ 1 degree")
 	print("  a: toggle auto-level from CORI telemetry")
-	print("  y: toggle yaw mode (manual / GPS)")
+	print("  y: cycle yaw mode (manual / GPS / flow)")
 	print("  p: play/pause")
 	print("  i: toggle on-screen info panel")
 	print("  s: save full video from frame 0 using current settings")
