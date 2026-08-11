@@ -106,10 +106,10 @@ detalis aout GPMF can be found https://github.com/gopro/gpmf-parser
 
 
 
+## Viewer with gpmf Telemetry and Raft
 
 
-
-
+![alt text](image/image-raft.png)
 
 
 

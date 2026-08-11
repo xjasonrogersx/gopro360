@@ -875,6 +875,7 @@ def run_raft_crop_preview(state: ViewerState, input_path: Path, raft_onnx_path: 
 				state.raft_input_crop = crop_curr.copy()
 				state.raft_output = flow_img.copy()
 				state.raft_status = f"RAFT {frame_count}/{max_preview_frames}"
+				state.dirty = True
 			prev_frame = frame
 			crop_prev = crop_curr
 			if time.time() - last_status >= 0.1:
@@ -1058,7 +1059,7 @@ def run() -> int:
 				set_temp_status(state, state.export_status.message or "Export finished", 4.0)
 				state.export_status.done = False
 
-		if state.dirty or state.paused:
+		if state.dirty or state.paused or (state.raft_input_crop is not None and state.raft_output is not None):
 			display = render_frame(frame, state)
 			draw_horizon_overlay(display, state)
 			draw_overlay(display, state, fps, total_frames)
