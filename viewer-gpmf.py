@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -13,8 +14,15 @@ from py_gpmf_parser.gopro_telemetry_extractor import GoProTelemetryExtractor
 from scipy.interpolate import CubicSpline, interp1d
 from scipy.spatial.transform import Rotation as R
 
+RAFT_EXAMPLE_DIR = Path("/home/jason/work/gopro360/ONNX-RAFT-Optical-Flow-Estimation")
+if str(RAFT_EXAMPLE_DIR) not in sys.path:
+	sys.path.insert(0, str(RAFT_EXAMPLE_DIR))
+
+from raft import Raft
+
 
 WINDOW_NAME = "gopro360 viewer"
+RAFT_PREVIEW_WINDOW = "RAFT crop preview"
 MIN_FOV = 30.0
 MAX_FOV = 170.0
 ASPECT_PRESETS = [
@@ -23,7 +31,7 @@ ASPECT_PRESETS = [
 	("9:16", 1080, 1920),
 	("4:3", 1440, 1080),
 ]
-DEFAULT_RAFT_ONNX = Path(__file__).resolve().parent / "raft" / "raft_light_small_360x480.onnx"
+DEFAULT_RAFT_ONNX = Path("/home/jason/work/gopro360/ONNX-RAFT-Optical-Flow-Estimation/models/raft_small_iter20_360x480.onnx")
 
 
 @dataclass
@@ -77,6 +85,11 @@ class ViewerState:
 	telemetry: TelemetryData = field(default_factory=TelemetryData)
 	use_auto_level: bool = True
 	yaw_mode: str = "manual"
+	raft_active: bool = False
+	raft_status: str = ""
+	raft_input_crop: np.ndarray | None = None
+	raft_output: np.ndarray | None = None
+	raft_thread: threading.Thread | None = None
 	export_lock: threading.Lock = field(default_factory=threading.Lock)
 	export_status: ExportStatus = field(default_factory=ExportStatus)
 	export_thread: threading.Thread | None = None
@@ -527,6 +540,39 @@ def draw_horizon_overlay(frame: np.ndarray, state: ViewerState) -> None:
 	cv2.line(frame, (0, y0), (w - 1, y1), (0, 255, 255), 2, cv2.LINE_AA)
 
 
+def crop_frame_to_fov(frame: np.ndarray, state: ViewerState, out_w: int = 480, out_h: int = 360) -> np.ndarray:
+	if frame.size == 0:
+		return frame
+	in_h, in_w = frame.shape[:2]
+	yaw_deg, pitch_deg, roll_deg = get_effective_orientation(state, state.frame_idx)
+	map_x, map_y = build_remap(
+		in_h=in_h,
+		in_w=in_w,
+		out_h=out_h,
+		out_w=out_w,
+		yaw_deg=yaw_deg,
+		pitch_deg=pitch_deg,
+		roll_deg=roll_deg,
+		fov_deg=state.fov,
+	)
+	return cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+
+
+def make_raft_preview_pair(input_crop: np.ndarray, flow_img: np.ndarray) -> np.ndarray:
+	left = input_crop.copy()
+	right = flow_img.copy()
+	if left.ndim == 2:
+		left = cv2.cvtColor(left, cv2.COLOR_GRAY2BGR)
+	if right.ndim == 2:
+		right = cv2.cvtColor(right, cv2.COLOR_GRAY2BGR)
+	if right.shape[:2] != left.shape[:2]:
+		right = cv2.resize(right, (left.shape[1], left.shape[0]), interpolation=cv2.INTER_LINEAR)
+	panel = np.hstack((left, right))
+	cv2.putText(panel, "input crop", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+	cv2.putText(panel, "RAFT output", (left.shape[1] + 12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+	return panel
+
+
 def draw_overlay(frame: np.ndarray, state: ViewerState, fps: float, total_frames: int) -> None:
 	if not state.show_info:
 		return
@@ -779,6 +825,67 @@ def start_export(state: ViewerState, input_path: Path, output_path: Path) -> Non
 	state.status_until = time.time() + 3.0
 
 
+def run_raft_crop_preview(state: ViewerState, input_path: Path, raft_onnx_path: Path) -> None:
+	cap = cv2.VideoCapture(str(input_path))
+	if not cap.isOpened():
+		with state.export_lock:
+			state.raft_active = False
+			state.raft_status = "RAFT failed: could not open input video"
+			state.raft_input_crop = None
+			state.raft_output = None
+		return
+
+	start_frame = max(0, min(state.frame_idx, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) - 1))
+	cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+	ok, prev_frame = cap.read()
+	if not ok:
+		cap.release()
+		with state.export_lock:
+			state.raft_active = False
+			state.raft_status = "RAFT failed: no preview frames available"
+			state.raft_input_crop = None
+			state.raft_output = None
+		return
+
+	try:
+		flow_estimator = Raft(str(raft_onnx_path))
+	except Exception:
+		cap.release()
+		with state.export_lock:
+			state.raft_active = False
+			state.raft_status = "RAFT failed: could not load ONNX model"
+			state.raft_input_crop = None
+			state.raft_output = None
+		return
+
+	crop_prev = crop_frame_to_fov(prev_frame, state, out_w=480, out_h=360)
+	frame_count = 0
+	max_preview_frames = 12
+	last_status = time.time()
+	try:
+		while frame_count < max_preview_frames:
+			ok, frame = cap.read()
+			if not ok:
+				break
+			frame_count += 1
+			crop_curr = crop_frame_to_fov(frame, state, out_w=480, out_h=360)
+			flow_map = flow_estimator(crop_prev, crop_curr)
+			flow_img = flow_estimator.draw_flow()
+			with state.export_lock:
+				state.raft_input_crop = crop_curr.copy()
+				state.raft_output = flow_img.copy()
+				state.raft_status = f"RAFT {frame_count}/{max_preview_frames}"
+			prev_frame = frame
+			crop_prev = crop_curr
+			if time.time() - last_status >= 0.1:
+				last_status = time.time()
+	finally:
+		cap.release()
+		with state.export_lock:
+			state.raft_active = False
+			state.raft_status = "RAFT crop ready"
+
+
 def set_temp_status(state: ViewerState, text: str, seconds: float = 1.5) -> None:
 	state.status_text = text
 	state.status_until = time.time() + seconds
@@ -809,10 +916,30 @@ def mouse_callback(event: int, x: int, y: int, flags: int, userdata: ViewerState
 		set_temp_status(state, f"FOV {state.fov:.1f}", 0.7)
 
 
-def process_key(key: int, state: ViewerState, input_path: Path, output_path: Path) -> bool:
+def start_raft_preview(state: ViewerState, input_path: Path, raft_onnx_path: Path) -> None:
+	with state.export_lock:
+		if state.raft_active:
+			set_temp_status(state, "RAFT already running", 1.2)
+			return
+		state.raft_active = True
+		state.raft_status = "Starting RAFT crop..."
+		state.raft_input_crop = None
+		state.raft_output = None
+	state.raft_thread = threading.Thread(
+		target=run_raft_crop_preview,
+		args=(state, input_path, raft_onnx_path),
+		daemon=True,
+	)
+	state.raft_thread.start()
+	set_temp_status(state, "Running RAFT crop...", 1.5)
+
+
+def process_key(key: int, state: ViewerState, input_path: Path, output_path: Path, raft_onnx_path: Path) -> bool:
 	if key in (27, ord("q")):
 		return False
 	if key == ord("r"):
+		start_raft_preview(state, input_path, raft_onnx_path)
+	elif key == ord("t"):
 		state.preset_idx = (state.preset_idx + 1) % len(ASPECT_PRESETS)
 		_, out_w, out_h = ASPECT_PRESETS[state.preset_idx]
 		cv2.resizeWindow(WINDOW_NAME, out_w, out_h)
@@ -875,18 +1002,7 @@ def run() -> int:
 	total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 	state.telemetry = load_gpmf_telemetry(input_path, max(total_frames, 1))
 	if state.telemetry.gps_heading_deg is None:
-		print("No GPS heading found in GPMF telemetry")
-		raft_onnx_path = Path(args.raft_onnx)
-		flow_heading = compute_flow_heading_series(input_path, max(total_frames, 1), raft_onnx_path)
-		if flow_heading is not None:
-			state.telemetry.flow_heading_deg = flow_heading
-			if state.telemetry.source == "none":
-				state.telemetry.source = "flow"
-			else:
-				state.telemetry.source = f"{state.telemetry.source}+flow"
-			print(f"Loaded RAFT flow yaw from {raft_onnx_path}")
-		else:
-			print("No GPS heading and RAFT flow yaw unavailable; yaw stays manual")
+		print("No GPS heading found in GPMF telemetry; press 'r' to run RAFT on the current crop.")
 	if state.telemetry.source != "none":
 		print(f"Loaded GPMF telemetry ({state.telemetry.source})")
 	else:
@@ -906,14 +1022,17 @@ def run() -> int:
 	state.dirty = True
 
 	cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+	cv2.namedWindow(RAFT_PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
 	_, out_w, out_h = ASPECT_PRESETS[state.preset_idx]
 	cv2.resizeWindow(WINDOW_NAME, out_w, out_h)
+	cv2.resizeWindow(RAFT_PREVIEW_WINDOW, 1000, 420)
 	cv2.setMouseCallback(WINDOW_NAME, mouse_callback, state)
 
 	print("Controls:")
 	print("  drag mouse: pan/tilt")
 	print("  mouse wheel: adjust FOV")
-	print("  r: cycle preview aspect preset")
+	print("  r: run RAFT on the current direction crop")
+	print("  t: cycle preview aspect preset")
 	print("  z/x: roll -/+ 1 degree")
 	print("  a: toggle auto-level from CORI telemetry")
 	print("  y: cycle yaw mode (manual / GPS / flow)")
@@ -944,6 +1063,9 @@ def run() -> int:
 			draw_horizon_overlay(display, state)
 			draw_overlay(display, state, fps, total_frames)
 
+			if state.raft_input_crop is not None and state.raft_output is not None:
+				cv2.imshow(RAFT_PREVIEW_WINDOW, make_raft_preview_pair(state.raft_input_crop, state.raft_output))
+
 			with state.export_lock:
 				if state.export_status.active and state.show_info:
 					elapsed = max(time.time() - state.export_status.started_at, 1e-6)
@@ -967,9 +1089,10 @@ def run() -> int:
 
 		key = cv2.waitKey(10) & 0xFF
 		if key != 255:
-			should_run = process_key(key, state, input_path, output_path)
+			should_run = process_key(key, state, input_path, output_path, Path(args.raft_onnx))
 
 	cap.release()
+	cv2.destroyWindow(RAFT_PREVIEW_WINDOW)
 	cv2.destroyAllWindows()
 	if state.export_thread and state.export_thread.is_alive():
 		print("Waiting for active export to finish...")
